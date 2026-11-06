@@ -19,7 +19,7 @@ Modo de espacio de trabajo **matrix** para [Omarchy](https://omarchy.org): un la
   - `SUPER + L` recorre tiling → scrolling → floating → matrix.
   - `SUPER + ALT + L` va en sentido contrario.
 - **Appearance › Workspace Layout:** permite elegir Matrix como layout por defecto.
-  - Con [omarchy-menu-plus](../omarchy-menu-plus) instalado, las entradas usan las mismas teselas que el botón de la barra.
+  - Con [omarchy-menu-plus](https://github.com/aonath/omarchy-menu-plus) instalado, las entradas usan las mismas teselas que el botón de la barra.
 - **Opciones de ventana de Omarchy:** los marcos las siguen.
   - **Window Corners:** el redondeo se aplica a encabezado más ventana, y también al borde activo.
   - **Window Gaps:** se respetan los espacios entre ventanas.
@@ -44,6 +44,8 @@ Modo de espacio de trabajo **matrix** para [Omarchy](https://omarchy.org): un la
 ## Instalar
 
 ```bash
+git clone https://github.com/aonath/omarchy-matrix.git
+cd omarchy-matrix
 ./install.sh
 ```
 
