@@ -1,0 +1,7 @@
+  // Appearance > Workspace Layout: matrix as a default layout next to Omarchy's
+  // three. @ICON_*@ become the bar button's tiles ("layout:<mode>", drawn by
+  // omarchy-menu-plus) or Nerd Font glyphs with the stock menu.
+  "appearance.workspace-layout.dwindle": {"icon":"@ICON_DWINDLE@","label":"Tiling","checked":"[[ $(omarchy-hyprland-workspace-layout-default) == \"dwindle\" ]]","action":"$HOME/.local/bin/matrix-layout-default dwindle"},
+  "appearance.workspace-layout.scrolling": {"icon":"@ICON_SCROLLING@","label":"Scrolling","checked":"[[ $(omarchy-hyprland-workspace-layout-default) == \"scrolling\" ]]","action":"$HOME/.local/bin/matrix-layout-default scrolling"},
+  "appearance.workspace-layout.floating": {"icon":"@ICON_FLOATING@","label":"Floating","checked":"[[ $(omarchy-hyprland-workspace-layout-default) == \"floating\" ]]","action":"$HOME/.local/bin/matrix-layout-default floating"},
+  "appearance.workspace-layout.matrix": {"icon":"@ICON_MATRIX@","label":"Matrix","description":"Scrolling columns that stack windows","checked":"[[ $(omarchy-hyprland-workspace-layout-default) == \"matrix\" ]]","action":"$HOME/.local/bin/matrix-layout-default matrix"},

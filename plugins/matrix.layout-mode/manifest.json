@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "matrix.layout-mode",
+  "name": "Layout mode",
+  "version": "1.0.0",
+  "author": "chucao",
+  "license": "MIT",
+  "description": "Workspace layout button: shows the mode of the workspace on this screen as window tiles and cycles tiling, scrolling, floating and matrix (right click goes back).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Layout mode",
+    "description": "Workspace layout button: shows the mode of the workspace on this screen as window tiles and cycles tiling, scrolling, floating and matrix (right click goes back).",
+    "category": "Compositor",
+    "allowMultiple": false
+  }
+}

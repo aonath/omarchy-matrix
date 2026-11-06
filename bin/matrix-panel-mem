@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Print the memory used by the app behind each window, for the matrix headers.
+
+Output (JSON on stdout):
+  {"pids": {"<window pid>": bytes, ...}, "vm": {"<window class>": bytes, ...},
+   "vm_windows": {"<window address>": bytes, ...}, "host_total": bytes, "host_used": bytes,
+   "vm_total": bytes, "vm_used": bytes}
+
+vm_windows covers windows whose class does not tell the app (Office documents
+opened from SharePoint links are all "protocolhandler"); their title does.
+
+host_total is the host RAM left for Linux apps (MemTotal minus the RAM given to
+running QEMU VMs) and host_used what of it is in use (MemTotal - MemAvailable,
+minus what the QEMU processes hold); vm_total is the RAM given to those VMs and
+vm_used what Windows reports in use (from the guest agent, cached like the rest).
+
+Linux windows: PSS of the window's process plus its descendants.
+Windows VM windows (FreeRDP RemoteApp): working set of the Windows app process
+tree, read from the winpodx guest agent. The guest figures are cached in
+$XDG_RUNTIME_DIR for CACHE_SECS and refreshed by a detached child, so this
+script always returns at once; the agent only, never the FreeRDP fallback.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+CACHE = os.path.join(RUNTIME, "winpodx-guest-mem.json")
+LOCK = CACHE + ".lock"
+CACHE_SECS = 15
+WINPODX_PY = os.path.expanduser("~/.local/bin/winpodx-app/.venv/bin/python")
+
+# Window class -> Windows process name, for classes that are not the exe stem.
+CLASS_TO_PROCESS = {
+    "winword": "WINWORD",
+    "excel": "EXCEL",
+    "powerpnt": "POWERPNT",
+    "outlook": "OUTLOOK",
+    "onedrive": "OneDrive",
+    "ms-teams": "ms-teams",
+    "winpodx-uwp-msteams_8wekyb3d8bbwe-msteams": "ms-teams",
+    # New Outlook (Store app): olk.exe; its WebView2 processes are its children.
+    "winpodx-uwp-microsoft-outlookforwindows_8wekyb3d8bbwe-microsoft": "olk",
+    "protocolhandler": "WINWORD",
+}
+
+# Window title suffix -> Windows process name, for "protocolhandler" windows.
+TITLE_TO_PROCESS = {
+    " - Excel": "EXCEL",
+    " - Word": "WINWORD",
+    " - PowerPoint": "POWERPNT",
+    " - Outlook": "OUTLOOK",
+}
+
+GUEST_SCRIPT = r"""
+$ws = @{}; $name = @{}; $parent = @{}; $kids = @{}
+Get-Process | ForEach-Object { $ws[[int]$_.Id] = [int64]$_.WorkingSet64 }
+foreach ($p in Get-CimInstance Win32_Process) {
+  $id = [int]$p.ProcessId; $pp = [int]$p.ParentProcessId
+  $name[$id] = [IO.Path]::GetFileNameWithoutExtension($p.Name); $parent[$id] = $pp
+  if (-not $kids.ContainsKey($pp)) { $kids[$pp] = New-Object System.Collections.Generic.List[int] }
+  $kids[$pp].Add($id)
+}
+function TreeSum([int]$id, [int]$depth) {
+  $s = [int64]$ws[$id]
+  if ($depth -lt 8 -and $kids.ContainsKey($id)) { foreach ($k in $kids[$id]) { if ($k -ne $id) { $s += TreeSum $k ($depth + 1) } } }
+  return $s
+}
+$out = @{}
+foreach ($id in $name.Keys) {
+  $n = $name[$id]
+  if ($name[$parent[$id]] -eq $n) { continue }  # counted in its parent's tree
+  $out[$n] = [int64]$out[$n] + (TreeSum $id 0)
+}
+$os = Get-CimInstance Win32_OperatingSystem
+# In use without the file cache (standby): total minus "available" (free + standby).
+$mem = Get-CimInstance Win32_PerfRawData_PerfOS_Memory
+$out["__used__"] = [int64]$os.TotalVisibleMemorySize * 1024 - [int64]$mem.AvailableBytes
+$out | ConvertTo-Json -Compress
+"""
+
+
+def parse_size(value):
+    """QEMU -m value ("6G", "6144", "size=6G,slots=2") -> bytes (default unit MiB)."""
+    for part in value.split(","):
+        part = part.split("=", 1)[1] if part.startswith("size=") else part
+        if "=" in part:
+            continue
+        units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+        unit = units.get(part[-1:].upper())
+        try:
+            return int(float(part[:-1] if unit else part) * (unit or 1 << 20))
+        except ValueError:
+            return 0
+    return 0
+
+
+def vm_ram():
+    """(RAM given to running QEMU VMs, RAM their processes hold) in bytes."""
+    total, held = 0, 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                args = fh.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if not os.path.basename(args[0]).startswith("qemu-system"):
+            continue
+        for i, arg in enumerate(args[:-1]):
+            if arg == "-m":
+                total += parse_size(args[i + 1])
+                break
+        try:
+            with open(f"/proc/{entry}/status") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        held += int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+    return total, held
+
+
+def meminfo():
+    """(MemTotal, MemAvailable) in bytes."""
+    values = {}
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            key, rest = line.split(":", 1)
+            values[key] = int(rest.split()[0]) * 1024
+    return values.get("MemTotal", 0), values.get("MemAvailable", 0)
+
+
+def descendants_pss(root):
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fh:
+                ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    total, stack, seen = 0, [root], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as fh:
+                for line in fh:
+                    if line.startswith("Pss:"):
+                        total += int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+        stack.extend(children.get(pid, []))
+    return total
+
+
+HMP_BALLOON = (
+    "import socket, time\n"
+    "s = socket.socket(socket.AF_UNIX); s.connect('/run/shm/monitor.sock'); s.settimeout(2)\n"
+    "time.sleep(0.2)\n"
+    "try:\n    s.recv(65536)\nexcept OSError:\n    pass\n"
+    "s.send(b'info balloon\\n'); time.sleep(0.3); print(s.recv(65536).decode(errors='replace'))\n"
+)
+
+
+def balloon_actual():
+    """RAM the balloon leaves to Windows, in bytes (QEMU monitor), or 0 if unknown.
+
+    Windows counts the pages the balloon took back for Linux as "in use", so the
+    header subtracts them (2026-11-04: it showed 5.4 of 6 GB with only Outlook open)."""
+    try:
+        out = subprocess.run(["podman", "exec", "winpodx-windows", "python3", "-c", HMP_BALLOON],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for word in out.split():
+        if word.startswith("actual="):
+            try:
+                return int(word.split("=", 1)[1]) << 20
+            except ValueError:
+                return 0
+    return 0
+
+
+def refresh_guest_cache():
+    """Query the guest agent and write the cache (runs in a detached child)."""
+    code = (
+        "import sys, json\n"
+        "from winpodx.core.config import Config\n"
+        "from winpodx.core.transport import agent_only\n"
+        "from winpodx.core.transport.dispatch import dispatch\n"
+        "with agent_only():\n"
+        "    r = dispatch(Config.load()).exec(sys.stdin.read(), timeout=30, description='panel-mem')\n"
+        "print(r.stdout.strip())\n"
+    )
+    try:
+        out = subprocess.run(
+            [WINPODX_PY, "-I", "-c", code], input=GUEST_SCRIPT, capture_output=True,
+            text=True, timeout=45,
+        ).stdout.strip().splitlines()
+        data = json.loads(out[-1]) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        data = None
+    if isinstance(data, dict):
+        data["__balloon__"] = balloon_actual()
+        tmp = CACHE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"time": time.time(), "procs": data}, fh)
+        os.replace(tmp, CACHE)
+
+
+def guest_procs(need):
+    try:
+        with open(CACHE) as fh:
+            cache = json.load(fh)
+    except (OSError, ValueError):
+        cache = {"time": 0, "procs": {}}
+    stale = time.time() - cache.get("time", 0) > CACHE_SECS
+    if need and stale:
+        try:
+            lock_age = time.time() - os.stat(LOCK).st_mtime
+        except OSError:
+            lock_age = None
+        if lock_age is None or lock_age > 60:
+            open(LOCK, "w").close()
+            if os.fork() == 0:
+                os.setsid()
+                try:
+                    refresh_guest_cache()
+                finally:
+                    try:
+                        os.unlink(LOCK)
+                    except OSError:
+                        pass
+                    os._exit(0)
+    return {k.lower(): v for k, v in cache.get("procs", {}).items()}
+
+
+def main():
+    try:
+        clients = json.loads(
+            subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=5).stdout
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        clients = []
+    pids, vm_classes, vm_titles = {}, set(), {}
+    for c in clients:
+        pid = c.get("pid") or 0
+        if pid <= 0:
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue
+        if comm.startswith("xfreerdp"):
+            vm_classes.add(c.get("class", ""))
+            title = c.get("title", "") if c.get("class") == "protocolhandler" else ""
+            for suffix, name in TITLE_TO_PROCESS.items():
+                if title.endswith(suffix):
+                    vm_titles[c.get("address", "")] = name.lower()
+        elif str(pid) not in pids:
+            pids[str(pid)] = descendants_pss(pid)
+    procs = guest_procs(bool(vm_classes))
+    vm = {}
+    for cls in vm_classes:
+        name = CLASS_TO_PROCESS.get(cls, cls).lower()
+        if name in procs:
+            vm[cls] = procs[name]
+    vm_windows = {a: procs[n] for a, n in vm_titles.items() if n in procs}
+    vm_total, vm_held = vm_ram()
+    total, available = meminfo()
+    json.dump({
+        "pids": pids, "vm": vm, "vm_windows": vm_windows,
+        "host_total": max(total - vm_total, 0),
+        "host_used": max(total - available - vm_held, 0),
+        "vm_total": vm_total,
+        # Windows in use minus what the balloon holds for Linux (see balloon_actual).
+        "vm_used": max(procs.get("__used__", 0)
+                       - (vm_total - procs["__balloon__"] if procs.get("__balloon__") else 0), 0),
+    }, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

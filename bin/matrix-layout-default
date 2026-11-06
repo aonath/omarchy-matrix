@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Show or set the default workspace layout, like
+# omarchy-hyprland-workspace-layout-default, with matrix (~/.config/hypr/omarchy-matrix.lua)
+# as a fourth choice. dwindle, scrolling and floating go to Omarchy's own command.
+#
+# Usage: matrix-layout-default [dwindle|scrolling|floating|matrix]
+
+if [[ ${1:-} != "matrix" ]]; then
+  exec omarchy-hyprland-workspace-layout-default "$@"
+fi
+
+notify_layout() {
+  local state="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layout-notification"
+  local last id
+  [[ -r $state ]] && read -r last <"$state"
+  if id=$(omarchy-notification-send -p -r "${last:-0}" -g 󱂬 "$1") && [[ $id =~ ^[0-9]+$ ]]; then
+    mkdir -p "$(dirname "$state")" && printf '%s\n' "$id" >"$state"
+  fi
+}
+
+MODES_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layouts"
+DEFAULT_FILE="$MODES_DIR/default.lua"
+
+mkdir -p "$MODES_DIR"
+
+# As Omarchy does: a workspace with windows keeps the layout it has, saved as
+# its own; every other workspace takes the new default.
+busy_workspace_ids() {
+  local workspaces clients
+  workspaces=$(hyprctl workspaces -j) || return 1
+  clients=$(hyprctl clients -j) || return 1
+  printf '%s\n%s\n' "$workspaces" "$clients" | jq -rs '
+    .[0] as $workspaces | .[1] as $clients |
+    if ($workspaces | type == "array") and ($clients | type == "array") then
+      (
+        [$workspaces[] | select(.id >= 1 and (.windows // 0) > 0) | .id] +
+        [$clients[]
+          | select(.workspace.name == "special:minimized")
+          | (.tags // [])[]
+          | select(test("^omarchy-minimized-from-[1-9][0-9]*$"))
+          | sub("^omarchy-minimized-from-"; "")
+          | tonumber]
+      ) | unique | .[]
+    else
+      error("not a workspace list")
+    end
+  '
+}
+
+if ! busy=$(busy_workspace_ids); then
+  echo "matrix-layout-default: could not read the workspaces or the minimized windows, so nothing was changed" >&2
+  exit 1
+fi
+
+while read -r workspace; do
+  [[ -n $workspace && ! -f $MODES_DIR/$workspace.lua ]] || continue
+  current=$(omarchy-hyprland-workspace-layout-current "$workspace")
+  [[ $current == "lua:matrix" ]] && current=matrix
+  if [[ $current != "matrix" ]]; then
+    printf 'o.workspace_mode({ workspace = "%s", mode = "%s" })\n' "$workspace" "$current" >"$MODES_DIR/$workspace.lua"
+  fi
+done <<<"$busy"
+
+for mode_file in "$MODES_DIR"/[0-9]*.lua; do
+  [[ -f $mode_file ]] || continue
+  workspace=$(basename "$mode_file" .lua)
+  grep -qx -- "$workspace" <<<"$busy" || rm -f "$mode_file"
+done
+
+printf 'o.workspace_mode({ default = "%s" })\n' matrix >"$DEFAULT_FILE"
+
+omarchy-restart-hyprctl
+omarchy-shell -q omarchy.workspaces refresh
+omarchy-shell -q omarchy.dock refresh
+notify_layout "Default layout set to matrix"

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "matrix.frames",
+  "name": "Matrix frames",
+  "version": "1.0.0",
+  "author": "chucao",
+  "license": "MIT",
+  "description": "Frames for windows on matrix workspaces: one border around a header row (app name, RAM, move and close buttons) and the window, following Omarchy's borders, corners, glass and animations.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Headers.qml"
+  }
+}
